@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import signal
 import sys
 import tempfile
 
@@ -12,7 +13,14 @@ from pg_cluster import temporary_postgres
 from wellio.app import create_app
 
 
+def stop_fixture(_signum, _frame):
+    # Uvicorn re-raises SIGTERM after graceful shutdown. Unwind the outer
+    # PostgreSQL context instead of letting the default signal kill Python.
+    raise SystemExit(0)
+
+
 if __name__ == '__main__':
+    signal.signal(signal.SIGTERM, stop_fixture)
     with temporary_postgres() as url, tempfile.TemporaryDirectory(prefix='wellio-client-test-') as directory:
         app = create_app(url, attachments_path=Path(directory) / 'uploads', agent_enabled='--agent-service' in sys.argv, agent_token=os.getenv('WELLIO_AGENT_TOKEN'), public_origins=tuple(filter(None, os.getenv('WELLIO_PUBLIC_ORIGIN', '').split(','))))
         with socket.socket() as listener:

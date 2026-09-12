@@ -22,6 +22,7 @@ Exa 使用 Python SDK 2.14.0、auto + highlights。训练动作目录由 FastAPI
 - Playwright：34 项浏览器测试通过，涵盖中英文、小屏、恢复检查、显式 Apply、训练生命周期和 SSE。
 - 完整生产栈：两次重启持久化烟测通过。
 - 真实 CopilotRuntime / BuiltInAgent → FastAPI → PostgreSQL HTTP 测试通过：上下文工具、保存回复、半份餐食修改、写后重读、Undo、会话隔离、重放、断开取消及进程重启。
+- 测试生命周期：19 项客户端回执测试复跑通过，确认退出后没有新增遗留 PostgreSQL；本次发现的孤立测试实例已停止清理。
 - Provider 测试经过真实 OpenAI chat provider 的受控 SSE（工具调用→工具结果→最终结构化输出），验证 OpenRouter 请求地址、Bearer header 和 HTTP 429 不自动重试。
 
 上述模型与搜索测试使用受控传输 / 官方 SDK 测试模型，没有调用付费 OpenRouter 或 Exa。真实模型效果、图片理解和搜索联调尚需 API 密钥；这不等于真实 API 联调已通过。尚未制作 macOS 安装包。
