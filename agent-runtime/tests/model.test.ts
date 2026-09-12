@@ -29,6 +29,8 @@ describe('OpenRouter provider configuration', () => {
     expect(await generated.output).toEqual(expected)
     expect(execute).toHaveBeenCalledTimes(1)
     expect(requests).toHaveLength(2)
+    expect(requests[0].body.reasoning).toMatchObject({enabled: false, effort: 'none'})
+    expect(requests[0].body.max_tokens).toBe(4096)
     expect(requests[0].body.tool_choice).toEqual({type: 'function', function: {name: 'get_day_context'}})
     expect(requests[0].body.tools[0].function.name).toBe('get_day_context')
     expect(requests[1].body.messages).toContainEqual(expect.objectContaining({role: 'tool', tool_call_id: 'server-context-call', content: expect.stringContaining('CURRENT_SERVER_CONTEXT')}))

@@ -63,6 +63,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     expect(model.doStreamCalls).toHaveLength(2)
     expect(model.doStreamCalls[0].toolChoice).toEqual({type: 'tool', toolName: 'get_day_context'})
     expect(model.doStreamCalls[0].tools?.map(tool => tool.name)).toEqual(['get_day_context'])
+    expect(model.doStreamCalls[1].responseFormat?.type).not.toBe('json')
     expect(model.doStreamCalls[1].tools?.map(tool => tool.name).sort()).toEqual([...toolNames].sort())
     expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('authoritative-watch')
     expect(JSON.stringify(model.doStreamCalls[0].prompt)).toContain('wellio-prompt/0.1.0')
@@ -234,6 +235,54 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     expect(options.abortSignal?.aborted).toBe(true)
     expect(textOf(events)).toBe('')
     expect(rpc.calls.find(call => call.name === 'cancel')!.payload).toMatchObject({status: 'failed', errorCode: 'TIMEOUT'})
+  })
+
+  it('closes the SSE response even when the provider ignores abort', async () => {
+    const late = deferred<ReturnType<typeof output>>()
+    const rpc = mockRpc()
+    const model = scriptedModel([() => toolCall(), () => late.promise])
+    const response = await runtime(model, rpc, {timeoutMs: 80}).handleRequest(request())
+    const events = parseEvents(await response.text())
+    expect(events.some(event => event.type === 'CUSTOM' && event.value.errorCode === 'TIMEOUT')).toBe(true)
+    expect(rpc.calls.some(call => call.name === 'finish')).toBe(false)
+    late.resolve(output())
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect(rpc.calls.some(call => call.name === 'finish')).toBe(false)
+  })
+
+  it('uses the remaining server lease instead of the longer model timeout', async () => {
+    const gate = gatedStep()
+    const rpc = mockRpc({open: () => ({runId: 'backend-run-uuid', messageId: 'assistant-id', request: chat,
+      events: [], tools: schemas, contextRequired: true, messages: [{role: 'user', content: 'TRUSTED_USER_MESSAGE'}], leaseExpiresAt: Date.now() + 1080})})
+    const model = scriptedModel([() => toolCall(), gate.step])
+    const response = await runtime(model, rpc, {timeoutMs: 5000}).handleRequest(request())
+    const options = await gate.entered
+    await response.text()
+    expect(options.abortSignal?.aborted).toBe(true)
+    expect(rpc.calls.find(call => call.name === 'cancel')!.payload).toMatchObject({errorCode: 'TIMEOUT'})
+  })
+
+  it('requires a verified meal update tool before allowing the final answer', async () => {
+    const rpc = mockRpc({open: () => ({runId: 'backend-run-uuid', messageId: 'assistant-id', request: chat,
+      events: [], tools: schemas, contextRequired: true, messages: [{role: 'user', content: 'TRUSTED_USER_MESSAGE'}],
+      preparedIntent: {kind: 'meal', constraint: {scope: 'meal_update'}}})})
+    const model = scriptedModel([() => toolCall(), options => {
+      expect(options.toolChoice).toEqual({type: 'tool', toolName: 'mutate_meal_log'})
+      expect(options.tools?.map(item => item.name)).toEqual(['mutate_meal_log'])
+      return toolCall('mutate_meal_log', {action: 'update'}, 'write')
+    }, () => toolCall('get_day_context', {}, 'fresh-context'), () => output()])
+    const response = await runtime(model, rpc).handleRequest(request())
+    expect(textOf(parseEvents(await response.text()))).toBe(answer.markdown)
+    expect(rpc.calls.filter(call => call.name === 'tool').map(call => call.payload.name)).toEqual(['get_day_context', 'mutate_meal_log', 'get_day_context'])
+  })
+
+  it('never saves an ellipsis placeholder as a completed model answer', async () => {
+    const rpc = mockRpc()
+    const response = await runtime(scriptedModel([() => toolCall(), () => output({...answer, markdown: '...'})]), rpc).handleRequest(request())
+    const events = parseEvents(await response.text())
+    expect(textOf(events)).toBe('')
+    expect(rpc.calls.some(call => call.name === 'finish')).toBe(false)
+    expect(rpc.calls.find(call => call.name === 'cancel')!.payload).toMatchObject({errorCode: 'INVALID_MODEL_OUTPUT'})
   })
 
   it('authenticates explicit Stop to the active cookie and never stops another cookie', async () => {

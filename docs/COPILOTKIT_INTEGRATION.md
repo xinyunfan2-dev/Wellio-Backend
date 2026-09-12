@@ -40,3 +40,5 @@ uv run --frozen python tests/copilot_smoke.py /absolute/path/to/Wellio-Frontend/
 最后一个命令要求前端已在独立目录构建，避免覆盖运行中展示服务的 `.output`。前后端保持独立仓库；API、服务启动与环境变量见各 README。
 
 OpenRouter 官方：[模型](https://openrouter.ai/deepseek/deepseek-v4.1-flash)、[接入](https://openrouter.ai/docs/quickstart)。2026-09-12 核实 exact ID 与 tools/tool_choice 支持，不把公开目录查询算作真实推理调用。
+
+后续：2026-09-12 已完成基础真实 API 联调及相关修复，最新证据见 [真实 API 验证](LIVE_API_VERIFICATION.md)。上文受控测试记录为最初集成基线。

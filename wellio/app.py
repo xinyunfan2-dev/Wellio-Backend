@@ -103,7 +103,7 @@ async def until_disconnect(request, operation):
             await asyncio.gather(task, watcher, return_exceptions=True)
 
 
-def create_app(database_url, attachments_path=None, public_origins=(), cookie_secure=None, search_service=None, agent_token=None, agent_enabled=False, agent_timeout_seconds=20, now=None):
+def create_app(database_url, attachments_path=None, public_origins=(), cookie_secure=None, search_service=None, agent_token=None, agent_enabled=False, agent_timeout_seconds=120, now=None):
     database = Database(database_url)
     cookies = SessionCookies(database.signing_key)
     attachments = AttachmentStore(attachments_path or Path('.data/attachments').absolute())

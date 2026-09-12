@@ -137,3 +137,13 @@ uv run --frozen python tests/copilot_smoke.py /absolute/path/to/Wellio-Frontend/
 ```
 
 全链路测试启动真实 CopilotKit BuiltInAgent、FastAPI 与临时 PostgreSQL，用官方 SDK 测试模型替代外部模型；测试包括对话落盘、上下文工具、会话隔离、重放、断开取消和进程重启。受控测试不能代替真实模型效果、图片识别质量或付费 Exa 联调。
+
+## 显式真实 API 联调
+
+普通测试不会读取真实密钥。需要真实联调时，先在本机 `.env` 配置 `OPENROUTER_API_KEY`、`EXA_API_KEY`，然后显式运行（会产生 API 用量）：
+
+```sh
+uv run --frozen python scripts/live_smoke.py --live --env-file .env --frontend /absolute/path/to/isolated-frontend-build --scenario all
+```
+
+测试使用临时 PostgreSQL 和演示数据，不连接 `.env` 中的业务数据库。模型使用官方 OpenRouter provider（AI SDK 6 兼容版本），关闭默认高强度推理并限制单次输出 4096 tokens；完整工具循环上限 115 秒，FastAPI 租约 120 秒。原始模型参数、密钥和对话不写运行日志，日志只记录 token 数量、结束原因和错误类型。

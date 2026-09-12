@@ -126,6 +126,9 @@ def test_finish_requires_real_fresh_read_and_preserves_structured_summaries(enab
 def test_meal_write_step_and_undo_pointer_are_atomic_and_force_new_context(enabled_client):
     client = enabled_client
     initial, _, run = opened(client, 'I only ate half of this item', targetMealId='meal-lunch', targetMealItemId='item-lunch')
+    assert '"mealId":"meal-lunch"' in run['instructions']
+    assert '"mealItemId":"item-lunch"' in run['instructions']
+    assert '"consumedFraction":0.5' in run['instructions']
     old_context = tool(client, run, 'get_day_context').json()['result']
     result = tool(client, run, 'mutate_meal_log', {'action': 'update', 'mealId': 'meal-lunch', 'mealItemId': 'item-lunch', 'changes': {'consumedFraction': .5}}).json()
     assert result['result']['result']['status'] == 'succeeded' and result['contextRequired']
@@ -386,3 +389,14 @@ def test_equipment_tool_exposes_only_valid_gym_catalog_and_load_basis(enabled_cl
         assert item['unit'] == 'kg' and item['name']['en'] and item['name']['zh-CN']
         assert all(lookup_equipment(id)['gymId'] == equipment['gymId'] for id in item['requiresEquipmentIds'])
     assert next(item for item in a['catalog'] if item['catalogId'] == 'one-arm-dumbbell-row')['requiresEquipmentIds'] == ['gym-a-dumbbells', 'gym-a-bench']
+
+
+def test_verified_meal_request_cannot_finish_with_a_false_saved_claim(enabled_client):
+    client = enabled_client
+    _, _, run = opened(client, 'I only ate half of this item', targetMealId='meal-lunch', targetMealItemId='item-lunch')
+    tool(client, run, 'get_day_context')
+    result = rpc(client, 'finish', {'runId': run['runId'], 'output': {**ANSWER, 'markdown': 'I saved half of your lunch.'}})
+    assert result.status_code == 409 and result.json()['errorCode'] == 'REQUESTED_ACTION_NOT_ATTEMPTED'
+    snapshot = client.get('/api/state').json()
+    assert snapshot['meals'][1]['items'][0]['consumedFraction'] == 1
+    assert snapshot['messages'][-1]['status'] == 'streaming'

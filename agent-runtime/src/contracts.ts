@@ -7,7 +7,7 @@ export interface StoredReply {httpStatus: number; result: JsonObject}
 export interface OpenReply {
   terminal?: boolean; events: LegacyEvent[]; reply?: StoredReply;
   runId?: string; messageId?: string; request?: ChatRequest; contextRequired?: boolean;
-  instructions?: string; tools?: Record<string, JsonObject>; messages?: ModelMessage[];
+  preparedIntent?: {kind: string; constraint?: {scope?: string}}; leaseExpiresAt?: number; instructions?: string; tools?: Record<string, JsonObject>; messages?: ModelMessage[];
   attachments?: {mediaType: string; data: string}[];
 }
 export interface ToolReply {result: unknown; events: LegacyEvent[]; contextRequired: boolean}
