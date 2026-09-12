@@ -27,7 +27,7 @@ def unused_port():
 
 @contextmanager
 def stack(frontend, database_url, uploads, port):
-    env = {**os.environ, 'DATABASE_URL': database_url, 'EXA_API_KEY': '', 'PORT': str(port), 'NITRO_PORT': str(port), 'HOST': '127.0.0.1', 'WELLIO_COOKIE_SECURE': '0', 'WELLIO_ATTACHMENTS_PATH': uploads, 'WELLIO_BACKEND_DIR': str(Path(__file__).resolve().parents[1]), 'WELLIO_PUBLIC_ORIGIN': f'http://127.0.0.1:{port}'}
+    env = {**os.environ, 'DATABASE_URL': database_url, 'EXA_API_KEY': '', 'OPENROUTER_API_KEY': '', 'WELLIO_AI_MODEL': '', 'PORT': str(port), 'NITRO_PORT': str(port), 'HOST': '127.0.0.1', 'WELLIO_COOKIE_SECURE': '0', 'WELLIO_ATTACHMENTS_PATH': uploads, 'WELLIO_BACKEND_DIR': str(Path(__file__).resolve().parents[1]), 'WELLIO_PUBLIC_ORIGIN': f'http://127.0.0.1:{port}'}
     with tempfile.TemporaryFile(mode='w+') as output:
         child = subprocess.Popen(['node', 'scripts/run-stack.mjs', 'start'], cwd=frontend, env=env, stdout=output, stderr=output)
         try:

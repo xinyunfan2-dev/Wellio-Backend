@@ -17,7 +17,7 @@ from pg_cluster import temporary_postgres
 @pytest.fixture(autouse=True)
 def isolated_configuration(monkeypatch):
     for name in (
-        "WELLIO_AI_MODEL", "WELLIO_AI_PROTOCOL", "WELLIO_AI_BASE_URL", "LOVABLE_API_KEY",
+        "WELLIO_AI_MODEL", "OPENROUTER_API_KEY",
         "DATABASE_URL", "WELLIO_EXA_API_KEY", "EXA_API_KEY",
         "WELLIO_PUBLIC_ORIGIN", "WELLIO_COOKIE_SECURE",
     ):

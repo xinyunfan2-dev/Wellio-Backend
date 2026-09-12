@@ -1,6 +1,9 @@
 """FastAPI transport preserving the existing same-origin /api contract."""
 import json
 import logging
+import asyncio
+import anyio
+import hmac
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
@@ -13,12 +16,11 @@ from starlette.responses import JSONResponse, Response
 
 from .actions import execute_action
 from .attachments import AttachmentStore, MAX_ATTACHMENT_BYTES
-from .chat_validation import parse_chat
 from .database import Database, now_ms
 from .errors import BackendError
-from .runtime import synchronize_runtime
 from .session import SessionCookies, SESSION_MAX_AGE_SECONDS
 from .validation import parse_action, action_adapter
+from .agent_service import AgentService
 
 
 def json_response(value, status=200, headers=None):
@@ -51,10 +53,10 @@ async def read_body(request, maximum):
     return bytes(data)
 
 
-async def read_json(request):
+async def read_json(request, maximum=16 * 1024):
     if request.headers.get('content-type', '').split(';')[0].strip().lower() != 'application/json':
         raise BackendError('UNSUPPORTED_MEDIA_TYPE', 415)
-    data = await read_body(request, 16 * 1024)
+    data = await read_body(request, maximum)
     def reject_constant(_value):
         raise ValueError()
     try:
@@ -80,10 +82,33 @@ async def read_attachment_form(request):
         raise BackendError('INVALID_INPUT', 400) from None
 
 
-def create_app(database_url, attachments_path=None, public_origins=(), cookie_secure=None, search_service=None):
+async def until_disconnect(request, operation):
+    """Keep cancellation active during preflight, before streaming headers exist."""
+    async def disconnected():
+        while (await request.receive())['type'] != 'http.disconnect':
+            pass
+    task = asyncio.ensure_future(operation)
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait((task, watcher), return_when=asyncio.FIRST_COMPLETED)
+        if watcher in done:
+            task.cancel()
+            raise asyncio.CancelledError()
+        return await task
+    finally:
+        watcher.cancel()
+        if not task.done():
+            task.cancel()
+        with anyio.move_on_after(3, shield=True):
+            await asyncio.gather(task, watcher, return_exceptions=True)
+
+
+def create_app(database_url, attachments_path=None, public_origins=(), cookie_secure=None, search_service=None, agent_token=None, agent_enabled=False, agent_timeout_seconds=20, now=None):
     database = Database(database_url)
     cookies = SessionCookies(database.signing_key)
     attachments = AttachmentStore(attachments_path or Path('.data/attachments').absolute())
+    token_valid = isinstance(agent_token, str) and 1 <= len(agent_token) <= 4096 and agent_token.strip() == agent_token and not any(ord(char) < 33 or ord(char) == 127 for char in agent_token)
+    agent = AgentService(database, attachments, search_service, enabled=bool(agent_enabled and token_valid), timeout_seconds=agent_timeout_seconds, now=now)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -91,6 +116,7 @@ def create_app(database_url, attachments_path=None, public_origins=(), cookie_se
             yield
         finally:
             try:
+                await agent.close()
                 if search_service is not None:
                     await search_service.close()
             finally:
@@ -100,6 +126,7 @@ def create_app(database_url, attachments_path=None, public_origins=(), cookie_se
     app.state.database = database
     app.state.attachments = attachments
     app.state.search = search_service
+    app.state.agent = agent
 
     @app.exception_handler(HTTPException)
     async def http_error(_request, error):
@@ -108,6 +135,44 @@ def create_app(database_url, attachments_path=None, public_origins=(), cookie_se
     @app.get('/healthz')
     async def health():
         return {'status': 'ok', 'backend': 'fastapi', 'schemaVersion': 4}
+
+    async def internal_agent(request: Request):
+        try:
+            supplied = request.headers.getlist('authorization')
+            expected = ('Bearer ' + agent_token).encode() if token_valid else b''
+            if not token_valid or len(supplied) != 1 or not hmac.compare_digest(supplied[0].encode(), expected):
+                raise BackendError('AGENT_AUTH_REQUIRED', 401)
+            assert_same_origin(request, public_origins)
+            sid = cookies.read(request)
+            if not sid:
+                raise BackendError('SESSION_REQUIRED', 401)
+            await run_in_threadpool(database.get_snapshot, sid)
+            value = await read_json(request, 128 * 1024)
+            operation = request.path_params['operation']
+            if operation == 'tool':
+                try:
+                    result = await until_disconnect(request, agent.tool(sid, value))
+                except asyncio.CancelledError:
+                    if isinstance(value, dict) and isinstance(value.get('runId'), str):
+                        try:
+                            agent.cancel(sid, {'runId': value['runId']})
+                        except BackendError:
+                            pass
+                    raise
+            elif operation == 'open':
+                # Run on the event-loop thread so accepted user priority can cancel
+                # an asynchronous menu search owned by this worker safely.
+                result = agent.open(sid, value)
+            elif operation in ('finish', 'cancel', 'status'):
+                result = getattr(agent, operation)(sid, value)
+            else:
+                raise BackendError('NOT_FOUND', 404)
+            return json_response(result)
+        except BackendError as error:
+            return json_response({'status': 'conflict' if error.http_status == 409 else 'failed', 'errorCode': error.code}, error.http_status)
+        except Exception as error:
+            logging.getLogger('wellio').error('Internal agent request failed (%s)', type(error).__name__)
+            return json_response({'status': 'failed', 'errorCode': 'INTERNAL_ERROR'}, 500)
 
     async def handle(request: Request):
         action = None
@@ -123,8 +188,7 @@ def create_app(database_url, attachments_path=None, public_origins=(), cookie_se
                     snapshot = await run_in_threadpool(database.create_session, expires)
                     sid = snapshot['sessionId']
                     headers['Set-Cookie'] = cookies.issue(sid, expires, secure)
-                capabilities = {'agent': False, 'menuSearch': bool(search_service and search_service.available)}
-                snapshot = await run_in_threadpool(synchronize_runtime, database, sid, capabilities)
+                snapshot = await run_in_threadpool(agent.snapshot, sid)
                 return json_response(snapshot, headers=headers)
             if not sid:
                 raise BackendError('SESSION_REQUIRED', 401)
@@ -140,10 +204,16 @@ def create_app(database_url, attachments_path=None, public_origins=(), cookie_se
                     raise BackendError('STALE_EPOCH', 409)
                 return json_response(saved)
             if path == '/api/chat':
-                raise BackendError('PROVIDER_NOT_CONFIGURED', 503)
+                raise BackendError('USE_COPILOTKIT_RUNTIME' if agent.available else 'PROVIDER_NOT_CONFIGURED', 410 if agent.available else 503)
             action = parse_action(await read_json(request))
-            reply = await run_in_threadpool(execute_action, database, sid, action)
+            if action['kind'] == 'request_proposal' and agent.available:
+                raise BackendError('USE_COPILOTKIT_RUNTIME', 410)
+            elif action['kind'] == 'check_readiness' and agent.available:
+                raise BackendError('USE_CHAT_READINESS_CHECK', 410)
+            else:
+                reply = await run_in_threadpool(execute_action, database, sid, action)
             if action['kind'] == 'reset_demo' and reply['result']['status'] == 'succeeded':
+                agent.abort_session(sid, action['resetEpoch'])
                 await run_in_threadpool(attachments.reset, sid, action['resetEpoch'])
             return json_response(reply['result'], reply['httpStatus'])
         except Exception as error:
@@ -165,6 +235,7 @@ def create_app(database_url, attachments_path=None, public_origins=(), cookie_se
         return schema
     app.openapi = openapi
     app.add_api_route('/api/chat', handle, methods=['POST'], name='chat')
+    app.add_api_route('/internal/agent/{operation}', internal_agent, methods=['POST'], name='internal_agent', include_in_schema=False)
     app.add_api_route('/api/attachments', handle, methods=['POST'], name='upload_attachment')
     app.add_api_route('/api/attachments/{attachment_id}', handle, methods=['GET'], name='read_attachment')
     return app

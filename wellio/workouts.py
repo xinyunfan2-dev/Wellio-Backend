@@ -59,6 +59,42 @@ def get_gym_equipment(gym_id, equipment_status=_UNSET):
     return {"gymId": gym_id, "equipment": [{**deepcopy(entry), "status": statuses.get(entry["equipmentId"], "available")} for entry in _EQUIPMENT if entry["gymId"] == gym_id]}
 
 
+def get_exercise_catalog(gym_id):
+    """Expose only executable catalog identities and their fixed constraints."""
+    equipment = get_gym_equipment(gym_id)['equipment']
+    names = {
+        'seated-cable-row': ('Seated cable row', '坐姿绳索划船'),
+        'lat-pulldown': ('Lat pulldown', '高位下拉'),
+        'dumbbell-curl': ('Dumbbell curl', '哑铃弯举'),
+        'one-arm-dumbbell-row': ('One-arm dumbbell row', '单臂哑铃划船'),
+        'pull-up': ('Pull-up', '引体向上'),
+        'goblet-squat': ('Goblet squat', '高脚杯深蹲'),
+        'dumbbell-romanian-deadlift': ('Dumbbell Romanian deadlift', '哑铃罗马尼亚硬拉'),
+        'reverse-lunge': ('Reverse lunge', '反向箭步蹲'),
+        'dumbbell-bench-press': ('Dumbbell bench press', '哑铃卧推'),
+        'dumbbell-shoulder-press': ('Dumbbell shoulder press', '哑铃肩推'),
+        'triceps-pushdown': ('Triceps pushdown', '绳索下压'),
+        'lateral-raise': ('Lateral raise', '侧平举'),
+    }
+    result = []
+    for catalog_id, definition in _CATALOG.items():
+        for item in equipment:
+            if item['kind'] != definition['equipment']:
+                continue
+            required = [item['equipmentId']]
+            if definition.get('bench'):
+                bench = next((entry for entry in equipment if entry['kind'] == 'bench'), None)
+                if bench is None:
+                    continue
+                required.append(bench['equipmentId'])
+            result.append({'catalogId': catalog_id, 'name': _label(*names[catalog_id]), 'split': definition['split'],
+                           'equipmentId': item['equipmentId'], 'equipment': item['name'], 'equipmentKind': item['kind'],
+                           'basis': item['load']['basis'], 'unit': 'kg', 'requiresEquipmentIds': required,
+                           'perSide': bool(definition.get('perSide')), 'sets': {'min': 1, 'max': 6},
+                           'reps': {'min': 1, 'max': 30}, 'restSeconds': {'min': 15, 'max': 300}})
+    return result
+
+
 def exercise_availability(snapshot, exercise):
     statuses = snapshot["conditions"].get("equipmentStatus", {})
     requirements = [exercise["equipmentId"]]
