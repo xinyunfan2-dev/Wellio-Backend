@@ -183,6 +183,8 @@ class AgentService:
         try:
             strict_object(output, {'markdown', 'trainingSummary', 'nutritionSummary'})
             for key, limit in (('markdown', 16000), ('trainingSummary', 2000), ('nutritionSummary', 2000)):
+                if key != 'markdown' and output[key] is None:
+                    continue
                 if not isinstance(output[key], str) or not output[key].strip() or len(output[key]) > limit:
                     raise BackendError('INVALID_MODEL_OUTPUT', 502)
         except BackendError:

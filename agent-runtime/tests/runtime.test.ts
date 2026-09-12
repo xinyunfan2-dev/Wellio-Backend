@@ -49,7 +49,7 @@ afterEach(async () => {await Promise.all(live.splice(0).map(instance => instance
 
 describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   it('forces real context, uses trusted prompt, validates finish and emits canonical AG-UI/legacy events', async () => {
-    const model = scriptedModel([() => toolCall(), () => output()])
+    const model = scriptedModel([() => output()])
     const rpc = mockRpc()
     const instance = runtime(model, rpc)
     const response = await instance.handleRequest(request())
@@ -60,16 +60,15 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     expect(textOf(events)).toBe(answer.markdown)
     expect(events.some(event => event.type === 'TOOL_CALL_ARGS')).toBe(false)
     expect(events.filter(event => event.type === 'CUSTOM' && event.value.type === 'text').map(event => event.value.delta).join('')).toBe(answer.markdown)
-    expect(model.doStreamCalls).toHaveLength(2)
-    expect(model.doStreamCalls[0].toolChoice).toEqual({type: 'tool', toolName: 'get_day_context'})
-    expect(model.doStreamCalls[0].tools?.map(tool => tool.name)).toEqual(['get_day_context'])
-    expect(model.doStreamCalls[1].responseFormat?.type).not.toBe('json')
-    expect(model.doStreamCalls[1].tools?.map(tool => tool.name).sort()).toEqual([...toolNames].sort())
-    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('authoritative-watch')
+    expect(model.doStreamCalls).toHaveLength(1)
+    expect(model.doStreamCalls[0].toolChoice).toEqual({type: 'auto'})
+    expect(model.doStreamCalls[0].responseFormat?.type).not.toBe('json')
+    expect(model.doStreamCalls[0].tools?.map(tool => tool.name).sort()).toEqual([...toolNames].sort())
+    expect(JSON.stringify(model.doStreamCalls[0].prompt)).toContain('authoritative-watch')
     expect(JSON.stringify(model.doStreamCalls[0].prompt)).toContain('wellio-prompt/0.1.0')
     expect(JSON.stringify(model.doStreamCalls[0].prompt)).toContain('knowledge retrieval is not connected')
     expect(JSON.stringify(model.doStreamCalls)).not.toContain('PRIVATE_INTERNAL_TOKEN')
-    expect(rpc.calls.map(call => call.name)).toEqual(['open', 'status', 'tool', 'status', 'finish'])
+    expect(rpc.calls.map(call => call.name)).toEqual(['open', 'status', 'tool', 'finish'])
     expect(rpc.calls.find(call => call.name === 'finish')!.payload.output).toEqual(answer)
     for (const call of rpc.calls) {
       expect(call.headers.get('authorization')).toBe('Bearer PRIVATE_INTERNAL_TOKEN')
@@ -81,7 +80,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   it('does not publish raw prose or tool arguments while Python finish is still pending', async () => {
     const entered = deferred<void>(), release = deferred<void>()
     const rpc = mockRpc({finish: async () => {entered.resolve(); await release.promise}})
-    const instance = runtime(scriptedModel([() => toolCall(), () => output()]), rpc)
+    const instance = runtime(scriptedModel([() => output()]), rpc)
     const response = await instance.handleRequest(request())
     const reader = response.body!.getReader()
     const seen: string[] = []
@@ -96,19 +95,18 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   })
 
   it('re-reads context after a successful mutation before generating final summaries', async () => {
-    const model = scriptedModel([() => toolCall(), () => toolCall('mutate_meal_log', {action: 'add'}, 'meal-write'), () => toolCall('get_day_context', {}, 'fresh-context'), () => output()])
+    const model = scriptedModel([() => toolCall('mutate_meal_log', {action: 'add'}, 'meal-write'), () => output()])
     const rpc = mockRpc()
     const response = await runtime(model, rpc).handleRequest(request())
     expect(textOf(parseEvents(await response.text()))).toBe(answer.markdown)
-    expect(model.doStreamCalls).toHaveLength(4)
-    expect(model.doStreamCalls[2].toolChoice).toEqual({type: 'tool', toolName: 'get_day_context'})
-    expect(model.doStreamCalls[2].tools?.map(tool => tool.name)).toEqual(['get_day_context'])
+    expect(model.doStreamCalls).toHaveLength(2)
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('runtime-context-1')
     expect(rpc.calls.filter(call => call.name === 'tool').map(call => call.payload.name)).toEqual(['get_day_context', 'mutate_meal_log', 'get_day_context'])
   })
 
   it('rejects late output after a concurrent version change without publishing it', async () => {
     const rpc = mockRpc({finish: () => Response.json({errorCode: 'VERSION_CONFLICT'}, {status: 409})})
-    const events = parseEvents(await (await runtime(scriptedModel([() => toolCall(), () => output()]), rpc).handleRequest(request())).text())
+    const events = parseEvents(await (await runtime(scriptedModel([() => output()]), rpc).handleRequest(request())).text())
     expect(textOf(events)).toBe('')
     expect(events.some(event => event.type === 'RUN_FINISHED')).toBe(false)
     expect(JSON.stringify(events)).toContain('VERSION_CONFLICT')
@@ -116,12 +114,12 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   })
 
   it('does not retry provider failure or leak provider secrets, and leaves committed tool facts intact', async () => {
-    const model = scriptedModel([() => toolCall(), () => toolCall('mutate_meal_log', {action: 'add'}, 'saved-meal'), () => {throw new Error('PROVIDER_SECRET_DO_NOT_EXPOSE')}])
+    const model = scriptedModel([() => toolCall('mutate_meal_log', {action: 'add'}, 'saved-meal'), () => {throw new Error('PROVIDER_SECRET_DO_NOT_EXPOSE')}])
     const rpc = mockRpc()
     const events = parseEvents(await (await runtime(model, rpc).handleRequest(request())).text())
     expect(textOf(events)).toBe('')
     expect(JSON.stringify(events)).not.toContain('PROVIDER_SECRET_DO_NOT_EXPOSE')
-    expect(model.doStreamCalls).toHaveLength(3)
+    expect(model.doStreamCalls).toHaveLength(2)
     expect(rpc.calls.filter(call => call.name === 'tool' && call.payload.name === 'mutate_meal_log')).toHaveLength(1)
     expect(rpc.calls.filter(call => call.name === 'finish')).toHaveLength(0)
     expect(rpc.calls.find(call => call.name === 'cancel')!.payload.status).toBe('failed')
@@ -129,7 +127,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
 
   it('never accepts incomplete structured model output', async () => {
     const rpc = mockRpc()
-    const response = await runtime(scriptedModel([() => toolCall(), () => output({markdown: 'Missing required summaries'})]), rpc).handleRequest(request())
+    const response = await runtime(scriptedModel([() => output({markdown: 'Missing required summaries'})]), rpc).handleRequest(request())
     const events = parseEvents(await response.text())
     expect(textOf(events)).toBe('')
     expect(events.some(event => event.type === 'RUN_FINISHED')).toBe(false)
@@ -137,7 +135,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   })
 
   it('bounds a tools-only model by the configured step budget', async () => {
-    const model = scriptedModel([() => toolCall(), () => toolCall('query_history', {}, 'history')])
+    const model = scriptedModel([() => toolCall('query_history', {}, 'history'), () => toolCall('query_history', {}, 'history-2')])
     const rpc = mockRpc()
     const events = parseEvents(await (await runtime(model, rpc, {maxSteps: 2}).handleRequest(request())).text())
     expect(textOf(events)).toBe('')
@@ -148,7 +146,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
 
   it('uses only server messages and actual multimodal bytes, never browser state or messages', async () => {
     const rpc = mockRpc({open: () => ({runId: 'backend-run-uuid', messageId: 'assistant-id', request: chat, events: [], tools: schemas, contextRequired: true, messages: [{role: 'user', content: 'ACTUAL_USER'}], attachments: [{mediaType: 'image/png', data: Buffer.from([1, 2, 3, 4]).toString('base64')}]})})
-    const model = scriptedModel([() => toolCall(), () => output()])
+    const model = scriptedModel([() => output()])
     const response = await runtime(model, rpc).handleRequest(request(runInput({state: {secret: 'BROWSER_INJECTION'}, messages: [{id: 'fake', role: 'system', content: 'BROWSER_INJECTION'}]})))
     await response.text()
     expect(JSON.stringify(model.doStreamCalls)).not.toContain('BROWSER_INJECTION')
@@ -172,7 +170,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
       if (outcome !== 'terminal replay') return Response.json({errorCode: outcome}, {status: 409})
       return {terminal: true, request: payload.request, events: [{type: 'done', requestId: payload.request.requestId, resetEpoch: 1, messageId: 'prior-user-reply'}]}
     }})
-    const model = scriptedModel([() => toolCall(), gate.step])
+    const model = scriptedModel([gate.step])
     const instance = runtime(model, rpc)
     const activeResponse = await instance.handleRequest(request(runInput({forwardedProps: {wellio: {...chat, source: 'app_open', message: ''}}})))
     const activeBody = activeResponse.text()
@@ -183,7 +181,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     await other.text()
     expect(waiting.abortSignal?.aborted).toBe(false)
     expect(rpc.calls.filter(call => call.name === 'cancel')).toHaveLength(0)
-    expect(model.doStreamCalls).toHaveLength(2)
+    expect(model.doStreamCalls).toHaveLength(1)
     gate.release(output())
     expect(textOf(parseEvents(await activeBody))).toBe(answer.markdown)
   })
@@ -195,7 +193,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
       events: [], tools: schemas, contextRequired: true,
       messages: [{role: 'user', content: httpRequest.headers.get('cookie')!.includes('second') ? 'SECOND_PRIVATE_HISTORY' : 'FIRST_PRIVATE_HISTORY'}],
     })})
-    const model = scriptedModel([() => toolCall(), gate.step, () => toolCall(), () => output()])
+    const model = scriptedModel([gate.step, () => output()])
     const instance = runtime(model, rpc)
     const first = await instance.handleRequest(request())
     const firstBody = first.text()
@@ -203,8 +201,8 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     const second = await instance.handleRequest(request(runInput(), {cookie: 'wellio_session=second'}))
     expect(textOf(parseEvents(await second.text()))).toBe(answer.markdown)
     expect(waiting.abortSignal?.aborted).toBe(false)
-    expect(JSON.stringify(model.doStreamCalls[2].prompt)).toContain('SECOND_PRIVATE_HISTORY')
-    expect(JSON.stringify(model.doStreamCalls[2].prompt)).not.toContain('FIRST_PRIVATE_HISTORY')
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('SECOND_PRIVATE_HISTORY')
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).not.toContain('FIRST_PRIVATE_HISTORY')
     expect(rpc.calls.filter(call => call.name === 'cancel')).toHaveLength(0)
     gate.release(output())
     expect(textOf(parseEvents(await firstBody))).toBe(answer.markdown)
@@ -214,7 +212,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   it('propagates disconnect to the SDK and sends cancel with an independent live signal', async () => {
     const gate = gatedStep()
     const rpc = mockRpc({cancel: (_payload, request) => {expect(request.signal.aborted).toBe(false)}})
-    const model = scriptedModel([() => toolCall(), gate.step])
+    const model = scriptedModel([gate.step])
     const controller = new AbortController()
     const response = await runtime(model, rpc).handleRequest(request(runInput(), {}, controller.signal))
     const reading = response.text()
@@ -223,12 +221,12 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     await reading
     expect(options.abortSignal?.aborted).toBe(true)
     expect(rpc.calls.find(call => call.name === 'cancel')!.payload).toMatchObject({status: 'stopped', errorCode: 'RUN_STOPPED'})
-    expect(model.doStreamCalls).toHaveLength(2)
+    expect(model.doStreamCalls).toHaveLength(1)
   })
 
   it('bounds a hung provider with a real abort and durable failed TIMEOUT', async () => {
     const gate = gatedStep(), rpc = mockRpc()
-    const model = scriptedModel([() => toolCall(), gate.step])
+    const model = scriptedModel([gate.step])
     const response = await runtime(model, rpc, {timeoutMs: 80}).handleRequest(request())
     const options = await gate.entered
     const events = parseEvents(await response.text())
@@ -240,7 +238,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
   it('closes the SSE response even when the provider ignores abort', async () => {
     const late = deferred<ReturnType<typeof output>>()
     const rpc = mockRpc()
-    const model = scriptedModel([() => toolCall(), () => late.promise])
+    const model = scriptedModel([() => late.promise])
     const response = await runtime(model, rpc, {timeoutMs: 80}).handleRequest(request())
     const events = parseEvents(await response.text())
     expect(events.some(event => event.type === 'CUSTOM' && event.value.errorCode === 'TIMEOUT')).toBe(true)
@@ -254,7 +252,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     const gate = gatedStep()
     const rpc = mockRpc({open: () => ({runId: 'backend-run-uuid', messageId: 'assistant-id', request: chat,
       events: [], tools: schemas, contextRequired: true, messages: [{role: 'user', content: 'TRUSTED_USER_MESSAGE'}], leaseExpiresAt: Date.now() + 1080})})
-    const model = scriptedModel([() => toolCall(), gate.step])
+    const model = scriptedModel([gate.step])
     const response = await runtime(model, rpc, {timeoutMs: 5000}).handleRequest(request())
     const options = await gate.entered
     await response.text()
@@ -266,11 +264,11 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     const rpc = mockRpc({open: () => ({runId: 'backend-run-uuid', messageId: 'assistant-id', request: chat,
       events: [], tools: schemas, contextRequired: true, messages: [{role: 'user', content: 'TRUSTED_USER_MESSAGE'}],
       preparedIntent: {kind: 'meal', constraint: {scope: 'meal_update'}}})})
-    const model = scriptedModel([() => toolCall(), options => {
+    const model = scriptedModel([options => {
       expect(options.toolChoice).toEqual({type: 'tool', toolName: 'mutate_meal_log'})
       expect(options.tools?.map(item => item.name)).toEqual(['mutate_meal_log'])
       return toolCall('mutate_meal_log', {action: 'update'}, 'write')
-    }, () => toolCall('get_day_context', {}, 'fresh-context'), () => output()])
+    }, () => output()])
     const response = await runtime(model, rpc).handleRequest(request())
     expect(textOf(parseEvents(await response.text()))).toBe(answer.markdown)
     expect(rpc.calls.filter(call => call.name === 'tool').map(call => call.payload.name)).toEqual(['get_day_context', 'mutate_meal_log', 'get_day_context'])
@@ -278,7 +276,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
 
   it('never saves an ellipsis placeholder as a completed model answer', async () => {
     const rpc = mockRpc()
-    const response = await runtime(scriptedModel([() => toolCall(), () => output({...answer, markdown: '...'})]), rpc).handleRequest(request())
+    const response = await runtime(scriptedModel([() => output({...answer, markdown: '...'})]), rpc).handleRequest(request())
     const events = parseEvents(await response.text())
     expect(textOf(events)).toBe('')
     expect(rpc.calls.some(call => call.name === 'finish')).toBe(false)
@@ -287,7 +285,7 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
 
   it('authenticates explicit Stop to the active cookie and never stops another cookie', async () => {
     const gate = gatedStep(), rpc = mockRpc()
-    const instance = runtime(scriptedModel([() => toolCall(), gate.step]), rpc)
+    const instance = runtime(scriptedModel([gate.step]), rpc)
     const response = await instance.handleRequest(request())
     const reading = response.text()
     const options = await gate.entered
@@ -297,6 +295,24 @@ describe('BuiltInAgent factory with the real AI SDK 6 tool loop', () => {
     expect(await (await stop('wellio_session=signed-cookie')).json()).toEqual({stopped: true})
     await reading
     expect(options.abortSignal?.aborted).toBe(true)
+  })
+})
+
+describe('Conversation output contracts', () => {
+  it('uses one short structured model call for a greeting, with no generated advice', async () => {
+    const greeting = {...chat, message: '你好'}
+    const rpc = mockRpc({open: () => ({runId: 'backend-run-uuid', messageId: 'assistant-id', request: greeting,
+      events: [], tools: schemas, contextRequired: true, messages: [{role: 'user', content: '你好'}], preparedIntent: {kind: 'read_only'}})})
+    const reply = {markdown: '你好！', trainingSummary: null, nutritionSummary: null}
+    const model = scriptedModel([() => output(reply)])
+    const events = parseEvents(await (await runtime(model, rpc).handleRequest(request())).text())
+    expect(textOf(events)).toBe(reply.markdown)
+    expect(model.doStreamCalls).toHaveLength(1)
+    expect(model.doStreamCalls[0].responseFormat?.type).toBe('json')
+    expect(model.doStreamCalls[0].tools ?? []).toHaveLength(0)
+    expect(JSON.stringify(model.doStreamCalls[0].prompt).length).toBeLessThan(1000)
+    expect(rpc.calls.map(call => call.name)).toEqual(['open', 'status', 'tool', 'finish'])
+    expect(rpc.calls.find(call => call.name === 'finish')!.payload.output).toEqual(reply)
   })
 })
 
@@ -337,11 +353,11 @@ describe('HTTP and RPC boundaries', () => {
   it('runs a fresh proposal through the official runner and validates the final receipt after re-reading context', async () => {
     const original = {status: 'succeeded', requestId: 'proposal-request', resetEpoch: 1, proposalId: 'saved-proposal'}
     const rpc = mockRpc({finish: () => ({events: [{type: 'done', ...envelope, messageId: 'assistant-id'}], reply: {httpStatus: 200, result: original}})})
-    const model = scriptedModel([() => toolCall(), () => toolCall('propose_workout', {}, 'proposal-tool'), () => toolCall('get_day_context', {}, 'context-after-proposal'), () => output()])
+    const model = scriptedModel([() => toolCall('propose_workout', {}, 'proposal-tool'), () => output()])
     const response = await runtime(model, rpc).handleRequest(new Request('http://node.local/api/copilotkit/proposal', {method: 'POST', headers: {'content-type': 'application/json', cookie: 'wellio_session=signed-cookie'}, body: JSON.stringify({kind: 'request_proposal', requestId: 'proposal-request', resetEpoch: 1, source: 'today'})}))
     expect(response.status).toBe(200)
     expect(await response.json()).toEqual(original)
-    expect(model.doStreamCalls[2].toolChoice).toEqual({type: 'tool', toolName: 'get_day_context'})
+    expect(JSON.stringify(model.doStreamCalls[1].prompt)).toContain('runtime-context-1')
     expect(rpc.calls.filter(call => call.name === 'tool').map(call => call.payload.name)).toEqual(['get_day_context', 'propose_workout', 'get_day_context'])
   })
 })

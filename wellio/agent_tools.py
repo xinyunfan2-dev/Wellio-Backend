@@ -106,6 +106,11 @@ async def _execute(deps, name, input, request_id, call_id):
         update_run(db, run, deps.now, lambda snapshot, current, message: current.update(lastContextReadId=context['id'], lastVersions=context['versions']))
         result = deepcopy(context)
         result['snapshot']['messages'] = []
+        # Historical records have their own bounded query_history tool. Sending
+        # the whole history every turn wastes tokens and duplicates model memory.
+        result['snapshot'].pop('history', None)
+        result['snapshot'].pop('advice', None)
+        result['snapshot'].pop('readinessCheck', None)
         return result
     if name == 'get_gym_equipment':
         strict_object(input, {'gymId'})

@@ -400,3 +400,30 @@ def test_verified_meal_request_cannot_finish_with_a_false_saved_claim(enabled_cl
     snapshot = client.get('/api/state').json()
     assert snapshot['meals'][1]['items'][0]['consumedFraction'] == 1
     assert snapshot['messages'][-1]['status'] == 'streaming'
+
+
+def test_greeting_with_null_summaries_preserves_valid_today_cards(enabled_client):
+    _, _, initial = opened(enabled_client)
+    tool(enabled_client, initial, 'get_day_context')
+    assert rpc(enabled_client, 'finish', {'runId': initial['runId'], 'output': ANSWER}).status_code == 200
+    before = enabled_client.get('/api/state').json()['advice']
+    _, _, greeting = opened(enabled_client, '你好')
+    context = tool(enabled_client, greeting, 'get_day_context').json()['result']
+    assert 'history' not in context['snapshot']
+    assert 'advice' not in context['snapshot']
+    assert context['snapshot']['meals'] and context['snapshot']['workout']
+    output = {'markdown': '你好！', 'trainingSummary': None, 'nutritionSummary': None}
+    result = rpc(enabled_client, 'finish', {'runId': greeting['runId'], 'output': output})
+    assert result.status_code == 200
+    saved = enabled_client.get('/api/state').json()
+    assert saved['advice'] == before
+    assert saved['messages'][-1]['content'] == '你好！'
+    assert saved['messages'][-1]['status'] == 'complete'
+
+
+@pytest.mark.parametrize('bad', ['', {}, [], 0, False])
+def test_no_update_requires_explicit_null_not_invalid_summary_values(enabled_client, bad):
+    _, _, run = opened(enabled_client, '你好')
+    tool(enabled_client, run, 'get_day_context')
+    response = rpc(enabled_client, 'finish', {'runId': run['runId'], 'output': {**ANSWER, 'trainingSummary': bad}})
+    assert response.status_code == 502

@@ -147,9 +147,15 @@ def finish_run(db, run, output, now):
         message.pop('phase', None)
         current['status'] = 'completed'
         current['outputHash'] = sha256(canonical_json(output).encode()).hexdigest()
-        snapshot['advice'] = {'status': 'valid', 'training': {locale: output['trainingSummary'] for locale in ('en', 'zh-CN')},
-                              'nutrition': {locale: output['nutritionSummary'] for locale in ('en', 'zh-CN')}, 'messageId': message['id'],
-                              'contextReadId': context['id'], 'versions': context_versions(snapshot)}
+        updates = {domain: {locale: output[key] for locale in ('en', 'zh-CN')}
+                   for domain, key in (('training', 'trainingSummary'), ('nutrition', 'nutritionSummary')) if output[key] is not None}
+        if updates:
+            previous = snapshot['advice']
+            retained = {key: previous[key] for key in ('training', 'nutrition') if key in previous} if previous.get('status') == 'valid' and previous.get('versions') == context_versions(snapshot) else {}
+            snapshot['advice'] = {'status': 'valid', **retained, **updates, 'messageId': message['id'],
+                                  'contextReadId': context['id'], 'versions': context_versions(snapshot)}
+        elif snapshot['advice'].get('messageId') == message['id'] and snapshot['advice']['status'] == 'pending':
+            snapshot['advice'] = {'status': 'unavailable'}
         if current.get('checkKey'):
             check = db.get_readiness_check(run['sessionId'], current['checkKey'])
             if check and check.get('attemptId') == current['checkAttemptId'] and check['status'] == 'pending':

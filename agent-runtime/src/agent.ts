@@ -1,12 +1,12 @@
 import {BuiltInAgent} from '@copilotkit/runtime/v2'
 import type {BaseEvent, RunAgentInput} from '@ag-ui/client'
-import {jsonSchema, stepCountIs, streamText, tool, type ModelMessage, type ToolSet} from 'ai'
+import {Output, jsonSchema, stepCountIs, streamText, tool, type ModelMessage, type ToolSet} from 'ai'
 import {z} from 'zod'
 import {BusinessRpc} from './rpc.js'
 import {PROMPT_VERSION, SYSTEM_PROMPT, TOOL_DESCRIPTIONS} from './prompt.js'
 import {RuntimeError, type FinishReply, type LegacyEvent, type OpenReply, type RuntimeOptions, type StoredReply, type ToolReply} from './contracts.js'
 
-const answerSchema = z.object({markdown: z.string().min(1).max(12000).refine(value => !/^[\s.…)\]_-]*$/.test(value), 'A substantive answer is required').describe('The complete standalone answer to the user: include every requested fact, image reading, source link and operation outcome here. The summary fields are separate Today cards and are NOT displayed in the chat. Never return only an introduction, a future promise, or a placeholder.'), trainingSummary: z.string().min(1).max(2000), nutritionSummary: z.string().min(1).max(2000)}).strict()
+const answerSchema = z.object({markdown: z.string().min(1).max(12000).refine(value => !/^[\s.…)\]_-]*$/.test(value), 'A substantive answer is required').describe('The complete standalone answer to the user: include every requested fact, image reading, source link and operation outcome here. The summary fields are separate Today cards and are NOT displayed in the chat. Never return only an introduction, a future promise, or a placeholder.'), trainingSummary: z.string().trim().min(1).max(2000).nullable(), nutritionSummary: z.string().trim().min(1).max(2000).nullable()}).strict()
 const TOOL_NAMES = new Set(['get_day_context', 'get_gym_equipment', 'query_history', 'search_restaurant_menu', 'mutate_meal_log', 'undo_meal_change', 'propose_workout', 'record_workout_progress'])
 
 function modelMessages(opened: OpenReply): ModelMessage[] {
@@ -42,8 +42,11 @@ export async function executeRun(options: RuntimeOptions, rpc: BusinessRpc, run:
   let contextRequired = opened.contextRequired !== false
   const intent = opened.preparedIntent
   const requiredTool = intent?.kind === 'meal' && ['meal_update', 'meal_delete'].includes(intent.constraint?.scope ?? '') ? 'mutate_meal_log' : intent?.kind === 'undo' ? 'undo_meal_change' : intent?.kind === 'progress' ? 'record_workout_progress' : undefined
+  const simpleChat = opened.preparedIntent?.kind === 'read_only' && !opened.attachments?.length && /^(?:你好|您好|嗨|早上好|晚上好|谢谢|多谢|hi|hello|hey|thanks|thank you)[\s!！.。]*$/i.test(opened.request.message.trim())
   let requiredToolAttempted = false
   let stepCount = 0
+  let contextSequence = 0
+  let contextMessages: ModelMessage[] = []
   const sendLegacy = (events: LegacyEvent[]) => {for (const event of events) run.onLegacy(event)}
   // Leave time to persist a terminal receipt before the FastAPI lease expires.
   const leaseBudget = opened.leaseExpiresAt === undefined ? Infinity : Math.max(1, opened.leaseExpiresAt - Date.now() - 1000)
@@ -54,6 +57,7 @@ export async function executeRun(options: RuntimeOptions, rpc: BusinessRpc, run:
     execute: async (input, {toolCallId}) => {
       const result = await rpc.call<ToolReply>('tool', {runId: backendRunId, toolCallId, name, input}, headers, signal)
       contextRequired = result.contextRequired
+      if (name === 'get_day_context') contextMessages = []
       if (name === requiredTool) requiredToolAttempted = true
       sendLegacy(result.events)
       return result.result
@@ -67,15 +71,30 @@ export async function executeRun(options: RuntimeOptions, rpc: BusinessRpc, run:
         const modelSignal = AbortSignal.any([signal, abortSignal])
         try {
           const generated = streamText({
-            model: options.model!, system: `${SYSTEM_PROMPT}\nPrompt version: ${PROMPT_VERSION}.\nCurrent capabilities: knowledge retrieval is not connected. Do not claim retrieved expert knowledge or invent citations. Only the eight registered tools are available.\nFinal response contract: after completing the requested tool work, return a JSON object with exactly three non-empty string fields. markdown is the COMPLETE standalone chat answer, including all requested facts, image readings, source links and actual outcomes. trainingSummary and nutritionSummary are short factual Today cards; they are NOT displayed in the chat. Use actual content, not placeholders. Do not promise future tool work and stop; execute the necessary tool now.\nTrusted current-run context: ${opened.instructions ?? ''}`,
-            messages: modelMessages(opened), tools,
+            model: options.model!, system: simpleChat ? 'You are Wellio, a friendly fitness companion. Briefly acknowledge this greeting or thanks in the language the user used. Do not give unsolicited advice or discuss personal records. Return JSON with exactly markdown (your short reply), trainingSummary: null, nutritionSummary: null.' : `${SYSTEM_PROMPT}\nPrompt version: ${PROMPT_VERSION}.\nCurrent capabilities: knowledge retrieval is not connected. Do not claim retrieved expert knowledge or invent citations. Only the eight registered tools are available.\nFinal response contract: after completing the requested tool work, return ONLY valid JSON with exactly these keys: {"markdown":"Your complete reply","trainingSummary":null,"nutritionSummary":null}. markdown must be a non-empty string. Each summary must be either a non-empty string when updating that Today card or JSON null to preserve it. For greetings and unrelated chat use null for both summaries. Never use an object, array, empty string, or extra keys. markdown is the COMPLETE standalone chat answer, including all requested facts, image readings, source links and actual outcomes. trainingSummary and nutritionSummary are short factual Today cards; they are NOT displayed in the chat. Use actual content, not placeholders. Do not promise future tool work and stop; execute the necessary tool now.\nThe runtime already calls get_day_context before your first step and after changes; its latest result is attached to your messages. Do not repeat that read unless necessary.\nTrusted current-run context: ${opened.instructions ?? ''}`,
+            messages: simpleChat ? [{role: 'user', content: opened.request!.message}] : modelMessages(opened), tools,
+            ...(simpleChat ? {output: Output.object({schema: answerSchema}), maxOutputTokens: 256} : {}),
             stopWhen: stepCountIs(maxSteps), maxRetries: 0, abortSignal: modelSignal,
-            prepareStep: async () => {
+            prepareStep: async ({messages}) => {
               const status = await rpc.call<{active: boolean; contextRequired: boolean}>('status', {runId: backendRunId}, headers, modelSignal)
               if (!status.active) throw new RuntimeError('RUN_NOT_ACTIVE', 409)
               contextRequired ||= status.contextRequired
-              return contextRequired ? {activeTools: ['get_day_context'], toolChoice: {type: 'tool' as const, toolName: 'get_day_context'}}
-                : requiredTool && !requiredToolAttempted ? {activeTools: [requiredTool], toolChoice: {type: 'tool' as const, toolName: requiredTool}} : {}
+              // Context is mandatory, so execute the authenticated read directly.
+              // Spending a model round trip just to ask for this read adds no value.
+              if (contextRequired) {
+                const toolCallId = `runtime-context-${contextSequence++}`
+                const result = await rpc.call<ToolReply>('tool', {runId: backendRunId, toolCallId, name: 'get_day_context', input: {}}, headers, modelSignal)
+                contextRequired = result.contextRequired
+                sendLegacy(result.events)
+                if (contextRequired) throw new RuntimeError('CONTEXT_READ_REQUIRED', 409)
+                contextMessages = [
+                  {role: 'assistant', content: [{type: 'tool-call', toolCallId, toolName: 'get_day_context', input: {}}]},
+                  {role: 'tool', content: [{type: 'tool-result', toolCallId, toolName: 'get_day_context', output: {type: 'json', value: result.result as any}}]},
+                ]
+              }
+              return {messages: simpleChat ? messages : [...messages, ...contextMessages],
+                ...(simpleChat ? {activeTools: [], toolChoice: 'none' as const} : {}),
+                ...(requiredTool && !requiredToolAttempted ? {activeTools: [requiredTool], toolChoice: {type: 'tool' as const, toolName: requiredTool}} : {})}
             },
             onStepFinish: ({usage, finishReason}) => {
               stepCount++
@@ -94,7 +113,7 @@ export async function executeRun(options: RuntimeOptions, rpc: BusinessRpc, run:
           }
           modelSignal.throwIfAborted()
           const finalText = (await generated.text).trim()
-          const jsonText = finalText.startsWith('```json\n') && finalText.endsWith('```') ? finalText.slice(8, -3).trim() : finalText
+          const jsonText = /^```(?:json)?\s*\n([\s\S]*?)\n?```$/i.exec(finalText)?.[1]?.trim() ?? finalText
           const output = answerSchema.parse(JSON.parse(jsonText))
           if (contextRequired) throw new RuntimeError('CONTEXT_READ_REQUIRED', 409)
           const result = await rpc.call<FinishReply>('finish', {runId: backendRunId, output}, headers, modelSignal)
