@@ -47,6 +47,7 @@ class Database:
         self._lock = threading.RLock()
         self._transaction_thread = None
         self._closed = False
+        self._agent_tool = None
         self.connection = psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
         try:
             self.connection.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
@@ -149,7 +150,7 @@ class Database:
         return {**outcome["result"], "requestId": request["requestId"], "resetEpoch": snapshot["resetEpoch"] if snapshot else current["resetEpoch"], **({"snapshot": snapshot} if snapshot else {})}
 
     def mutate(self, session_id, request, execute):
-        with self.transaction():
+        with self._business_transaction():
             self._lock_session(session_id)
             current = self.get_snapshot(session_id)
             previous = self.get_mutation_reply(session_id, request)
@@ -163,6 +164,8 @@ class Database:
                 if inspect.iscoroutine(outcome):
                     outcome.close()
                 raise RuntimeError("ASYNC_MUTATION_NOT_ALLOWED")
+            self._preempt_background_run(current, request, outcome)
+            self._bind_agent_mutation(current, request, outcome)
             self._save_snapshot(current, request, outcome.get("snapshot"))
             result = self._result(current, request, outcome)
             continuation = outcome.get("continuation")
@@ -240,6 +243,114 @@ class Database:
         row = self._one("SELECT record_json FROM agent_runs WHERE session_id=%s AND id=%s", (session_id, run_id))
         return json.loads(row["record_json"]) if row else None
 
+    def with_agent_tool(self, context, execute):
+        """Bind one synchronous domain mutation to its run under the same lock."""
+        with self.transaction():
+            self._lock_session(context['sessionId'])
+            previous, self._agent_tool = self._agent_tool, context
+            try:
+                self._assert_agent_mutation(self.get_snapshot(context['sessionId']))
+                result = execute()
+                if inspect.isawaitable(result):
+                    if inspect.iscoroutine(result):
+                        result.close()
+                    raise RuntimeError("ASYNC_MUTATION_NOT_ALLOWED")
+                self._assert_agent_mutation(self.get_snapshot(context['sessionId']))
+                return result
+            finally:
+                self._agent_tool = previous
+
+    @contextmanager
+    def _business_transaction(self):
+        # Only the controlled grant + mutation composition may reuse its outer
+        # transaction. Arbitrary nested runtime transactions remain forbidden.
+        with self._lock:
+            if self._agent_tool is not None:
+                self._require_transaction()
+                yield
+            else:
+                with self.transaction():
+                    yield
+
+    def _assert_agent_mutation(self, current):
+        context = self._agent_tool
+        run = self.get_agent_run(current['sessionId'], context['runId'])
+        if not run or run['status'] != 'pending' or run['resetEpoch'] != current['resetEpoch'] or run['leaseExpiresAt'] <= context['now']():
+            raise BackendError('RUN_NOT_ACTIVE', 409)
+        return run
+
+    def _preempt_background_run(self, current, request, outcome):
+        if self._agent_tool is not None or outcome['result']['status'] != 'succeeded' or request['kind'] not in ('start_workout', 'complete_exercise', 'undo_exercise', 'finish_workout', 'apply_proposal', 'dismiss_proposal', 'undo_meal'):
+            return
+        from .runtime import _stop_record
+        active = [run for run in self.list_agent_runs(current['sessionId']) if run['source'] == 'app_open' and run['status'] == 'pending' and run['resetEpoch'] == current['resetEpoch']]
+        if not active:
+            return
+        snapshot = outcome.get('snapshot')
+        if snapshot is None:
+            snapshot = copy.deepcopy(current)
+            snapshot['revision'] += 1
+            outcome['snapshot'] = snapshot
+        for run in active:
+            _stop_record(self, snapshot, run, 'stopped', 'USER_PRIORITY')
+
+    def _bind_agent_mutation(self, current, request, outcome):
+        context = self._agent_tool
+        if context is None:
+            return
+        run = self._assert_agent_mutation(current)
+        result = outcome["result"]
+        if result['status'] == 'succeeded':
+            run.pop('lastContextReadId', None)
+            run.pop('lastVersions', None)
+        if request["kind"] in ("undo_meal", "start_workout", "complete_exercise", "undo_exercise", "finish_workout") and result["status"] == "succeeded":
+            if run.get("intentConsumedBy") and run["intentConsumedBy"] != context["toolCallId"]:
+                raise BackendError("AUTHORIZATION_CONSUMED", 409)
+            run["intentConsumedBy"] = context["toolCallId"]
+        snapshot = outcome.get("snapshot")
+        if snapshot is None:
+            snapshot = copy.deepcopy(current)
+            snapshot["revision"] += 1
+        message = next((item for item in snapshot["messages"] if item["id"] == run["messageId"]), None)
+        if message is None:
+            raise BackendError("RUN_NOT_ACTIVE", 409)
+        step = next((item for item in message["steps"] if item.get("toolCallId") == context["toolCallId"]), None)
+        if step is not None:
+            step["status"] = "succeeded" if result["status"] == "succeeded" else "awaiting_user" if result["status"] == "needs_input" else "failed"
+            if result.get("errorCode"):
+                step["errorCode"] = result["errorCode"]
+        if result["status"] == "succeeded" and result.get("operationId") and request["kind"] in ("mutate_meal_log", "undo_meal"):
+            operation = self.get_meal_operation(current["sessionId"], current["resetEpoch"], result["operationId"])
+            if operation:
+                message.update(operationId=operation["id"], mealId=operation["mealId"])
+        if result["status"] == "succeeded" and result.get("proposalId"):
+            proposal = next((item for item in snapshot["proposals"] if item["id"] == result["proposalId"]), None)
+            if proposal:
+                message["proposalId"] = proposal["id"]
+                proposal["messageId"] = message["id"]
+                run["proposalId"] = proposal["id"]
+                if run.get("checkKey") and run.get("checkAttemptId"):
+                    proposal.update(checkKey=run["checkKey"], checkAttemptId=run["checkAttemptId"])
+                    check = self.get_readiness_check(current["sessionId"], run["checkKey"])
+                    if check and check.get("attemptId") == run["checkAttemptId"]:
+                        check["proposalId"] = proposal["id"]
+                        self.save_readiness_check(check)
+                        if snapshot.get("readinessCheck", {}).get("key") == check["key"]:
+                            snapshot["readinessCheck"]["proposalId"] = proposal["id"]
+        self.save_agent_run(run)
+        outcome["snapshot"] = snapshot
+
+    def store_agent_action_reply(self, snapshot, request, result):
+        """Save the original UI Action receipt inside the final run transaction."""
+        self._require_transaction()
+        previous = self.get_mutation_reply(snapshot["sessionId"], request)
+        if previous:
+            return previous
+        reply = {**result, "requestId": request["requestId"], "resetEpoch": snapshot["resetEpoch"], "snapshot": snapshot}
+        self.connection.execute("INSERT INTO action_requests(session_id,request_id,request_epoch,result_epoch,kind,payload_hash,http_status,result_json,created_at,continuation_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL)",
+                                (snapshot["sessionId"], request["requestId"], request["resetEpoch"], snapshot["resetEpoch"], request["kind"], payload_hash(request), 200, encode(reply), now_ms()))
+        return {"httpStatus": 200, "result": reply}
+
     def find_agent_run(self, session_id, request_id):
         row = self._one("SELECT record_json FROM agent_runs WHERE session_id=%s AND request_id=%s", (session_id, request_id))
         return json.loads(row["record_json"]) if row else None
@@ -300,7 +411,7 @@ class Database:
             raise BackendError("AUTHORIZATION_INVALID", 403)
 
     def issue_authorization(self, session_id, request, derive):
-        with self.transaction():
+        with self._business_transaction():
             self._lock_session(session_id)
             snapshot = self.get_snapshot(session_id)
             if snapshot["resetEpoch"] != request["resetEpoch"]:

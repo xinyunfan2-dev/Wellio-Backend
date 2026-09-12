@@ -14,21 +14,5 @@ services:
       interval: 3s
       timeout: 3s
       retries: 20
-  api:
-    build: .
-    environment:
-      DATABASE_URL: postgresql://wellio:${POSTGRES_PASSWORD:-wellio_local}@postgres:5432/wellio
-      WELLIO_PUBLIC_ORIGIN: ${WELLIO_PUBLIC_ORIGIN:-http://127.0.0.1:3100,http://localhost:3100}
-      WELLIO_ATTACHMENTS_PATH: /data/attachments
-      WELLIO_COOKIE_SECURE: ${WELLIO_COOKIE_SECURE:-0}
-      EXA_API_KEY: ${EXA_API_KEY:-}
-    ports:
-      - "127.0.0.1:${API_PORT:-8000}:8000"
-    volumes:
-      - wellio_attachments:/data
-    depends_on:
-      postgres:
-        condition: service_healthy
 volumes:
   wellio_pg:
-  wellio_attachments:
