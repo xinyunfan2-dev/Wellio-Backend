@@ -1,0 +1,381 @@
+"""PostgreSQL schema-4 repository with atomic synchronous business mutations."""
+import copy
+import inspect
+import json
+import os
+import re
+import psycopg
+from psycopg.rows import dict_row
+from psycopg.types.json import set_json_loads
+import threading
+import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from uuid import uuid4
+
+from .errors import BackendError
+from .migrate import migrate, validate_database_url
+from .seed import SCHEMA_VERSION, SEED_SOURCE, create_seed
+from .validation import canonical_json, payload_hash, require_id, require_int
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def iso_now():
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def encode(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def context_versions(snapshot):
+    return {"meal": snapshot["mealRevision"], "plan": snapshot["plan"]["version"], "workout": (snapshot.get("workout") or {}).get("version", 0), "conditions": snapshot["conditions"]["version"], "readiness": snapshot["readiness"]["version"]}
+
+
+def assert_context_versions(snapshot, expected):
+    current = context_versions(snapshot)
+    if any(current.get(key) != value for key, value in expected.items()):
+        raise BackendError("VERSION_CONFLICT", 409)
+
+
+class Database:
+    def __init__(self, database_url):
+        self.database_url = validate_database_url(database_url)
+        self._lock = threading.RLock()
+        self._transaction_thread = None
+        self._closed = False
+        self.connection = psycopg.connect(self.database_url, autocommit=True, row_factory=dict_row)
+        try:
+            self.connection.isolation_level = psycopg.IsolationLevel.READ_COMMITTED
+            # JSONB remains JSON text at this repository boundary, preserving the
+            # existing record decoder without a process-global psycopg adapter.
+            set_json_loads(lambda data: bytes(data).decode("utf-8"), self.connection)
+            migrate(self.connection)
+            with self.transaction():
+                self.connection.execute("INSERT INTO server_metadata(key,value) VALUES (%s,%s) ON CONFLICT (key) DO NOTHING", ("session_signing_key_v1", os.urandom(32).hex()))
+                raw_key = self.connection.execute("SELECT value FROM server_metadata WHERE key=%s", ("session_signing_key_v1",)).fetchone()["value"]
+                if not isinstance(raw_key, str) or not re.fullmatch(r"[0-9a-f]{64}", raw_key):
+                    raise ValueError("INVALID_SESSION_SIGNING_KEY")
+                self.signing_key = bytes.fromhex(raw_key)
+        except BaseException:
+            self.connection.close()
+            raise
+
+    def close(self):
+        with self._lock:
+            if not self._closed:
+                self.connection.close()
+                self._closed = True
+
+    @contextmanager
+    def transaction(self):
+        with self._lock:
+            if self._transaction_thread is not None:
+                raise RuntimeError("NESTED_TRANSACTION_NOT_ALLOWED")
+            self._transaction_thread = threading.get_ident()
+            try:
+                with self.connection.transaction():
+                    yield
+            finally:
+                self._transaction_thread = None
+
+    def _lock_session(self, session_id):
+        self._require_transaction()
+        # Lock before snapshot/receipt reads. Independent workers then observe
+        # the preceding committed receipt under PostgreSQL READ COMMITTED.
+        self.connection.execute("SELECT id FROM sessions WHERE id=%s FOR UPDATE", (session_id,)).fetchone()
+
+    def _require_transaction(self):
+        if self._transaction_thread != threading.get_ident():
+            raise RuntimeError("MUTATION_TRANSACTION_REQUIRED")
+
+    def _one(self, sql, parameters=()):
+        with self._lock:
+            return self.connection.execute(sql, parameters).fetchone()
+
+    def create_session(self, expires_at=None):
+        snapshot = create_seed(str(uuid4()))
+        with self._lock:
+            self.connection.execute("INSERT INTO sessions(id,reset_epoch,revision,schema_version,seed_source,snapshot_json,created_at,expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)", (snapshot["sessionId"], snapshot["resetEpoch"], snapshot["revision"], SCHEMA_VERSION, SEED_SOURCE, encode(snapshot), now_ms(), expires_at if expires_at is not None else now_ms() + 30 * 86400000))
+        return snapshot
+
+    def get_snapshot(self, session_id):
+        row = self._one("SELECT * FROM sessions WHERE id=%s", (session_id,))
+        if not row or row["expires_at"] <= now_ms():
+            raise BackendError("INVALID_SESSION", 401)
+        if row["schema_version"] != SCHEMA_VERSION:
+            raise RuntimeError("SNAPSHOT_SCHEMA_UNSUPPORTED")
+        snapshot = json.loads(row["snapshot_json"])
+        if any(isinstance(snapshot.get(key), bool) or not isinstance(snapshot.get(key), (int, float)) for key in ("schemaVersion", "resetEpoch", "revision")) or (snapshot.get("schemaVersion"), snapshot.get("sessionId"), snapshot.get("resetEpoch"), snapshot.get("revision")) != (row["schema_version"], session_id, row["reset_epoch"], row["revision"]):
+            raise RuntimeError("CORRUPT_SESSION_STATE")
+        return snapshot
+
+    @staticmethod
+    def _reply(row):
+        reply = {"httpStatus": row["http_status"], "result": json.loads(row["result_json"])}
+        if row["continuation_json"]:
+            reply["continuation"] = json.loads(row["continuation_json"])
+        return reply
+
+    def get_mutation_reply(self, session_id, request):
+        with self._lock:
+            current = self.get_snapshot(session_id)
+            previous = self._one("SELECT * FROM action_requests WHERE session_id=%s AND request_id=%s", (session_id, request["requestId"]))
+            reset_replay = previous and previous["kind"] == "reset_demo" and previous["http_status"] == 200 and previous["result_epoch"] == current["resetEpoch"] and previous["request_epoch"] == request["resetEpoch"]
+            if request["resetEpoch"] != current["resetEpoch"] and not reset_replay:
+                raise BackendError("STALE_EPOCH", 409)
+            if previous:
+                if previous["payload_hash"] != payload_hash(request):
+                    raise BackendError("IDEMPOTENCY_CONFLICT", 409)
+                return self._reply(previous)
+            return None
+
+    def _save_snapshot(self, current, request, snapshot):
+        if snapshot is None:
+            return
+        expected_epoch = current["resetEpoch"] + (1 if request["kind"] == "reset_demo" else 0)
+        if any(isinstance(snapshot.get(key), bool) or not isinstance(snapshot.get(key), (int, float)) for key in ("schemaVersion", "resetEpoch", "revision")) or (snapshot.get("schemaVersion"), snapshot.get("sessionId"), snapshot.get("resetEpoch"), snapshot.get("revision")) != (SCHEMA_VERSION, current["sessionId"], expected_epoch, current["revision"] + 1):
+            raise RuntimeError("INVALID_MUTATION_VERSION")
+        updated = self.connection.execute("UPDATE sessions SET reset_epoch=%s,revision=%s,snapshot_json=%s WHERE id=%s AND reset_epoch=%s AND revision=%s", (snapshot["resetEpoch"], snapshot["revision"], encode(snapshot), current["sessionId"], current["resetEpoch"], current["revision"]))
+        if updated.rowcount != 1:
+            raise BackendError("VERSION_CONFLICT", 409)
+
+    @staticmethod
+    def _result(current, request, outcome):
+        snapshot = outcome.get("snapshot")
+        return {**outcome["result"], "requestId": request["requestId"], "resetEpoch": snapshot["resetEpoch"] if snapshot else current["resetEpoch"], **({"snapshot": snapshot} if snapshot else {})}
+
+    def mutate(self, session_id, request, execute):
+        with self.transaction():
+            self._lock_session(session_id)
+            current = self.get_snapshot(session_id)
+            previous = self.get_mutation_reply(session_id, request)
+            if previous:
+                return previous
+            reserved = self.find_agent_run(session_id, request["requestId"])
+            if reserved and reserved["source"] == "ui_proposal" and canonical_json(reserved.get("actionRequest")) != canonical_json(request):
+                raise BackendError("IDEMPOTENCY_CONFLICT", 409)
+            outcome = execute(copy.deepcopy(current))
+            if inspect.isawaitable(outcome):
+                if inspect.iscoroutine(outcome):
+                    outcome.close()
+                raise RuntimeError("ASYNC_MUTATION_NOT_ALLOWED")
+            self._save_snapshot(current, request, outcome.get("snapshot"))
+            result = self._result(current, request, outcome)
+            continuation = outcome.get("continuation")
+            self.connection.execute("INSERT INTO action_requests(session_id,request_id,request_epoch,result_epoch,kind,payload_hash,http_status,result_json,created_at,continuation_json) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (session_id, request["requestId"], request["resetEpoch"], result["resetEpoch"], request["kind"], payload_hash(request), outcome["httpStatus"], encode(result), now_ms(), encode(continuation) if continuation else None))
+            if request["kind"] == "reset_demo" and outcome.get("snapshot"):
+                for table in ("context_reads", "write_authorizations", "meal_operations", "meal_entities", "agent_runs", "readiness_checks", "user_inputs"):
+                    self.connection.execute(f"DELETE FROM {table} WHERE session_id=%s", (session_id,))
+            return {"httpStatus": outcome["httpStatus"], "result": result, **({"continuation": continuation} if continuation else {})}
+
+    def resume_mutation(self, session_id, request, execute):
+        with self.transaction():
+            self._lock_session(session_id)
+            current = self.get_snapshot(session_id)
+            if current["resetEpoch"] != request["resetEpoch"]:
+                raise BackendError("STALE_EPOCH", 409)
+            previous = self.get_mutation_reply(session_id, request)
+            if not previous:
+                raise BackendError("NOT_FOUND", 404)
+            if not previous.get("continuation"):
+                return previous
+            outcome = execute(copy.deepcopy(current), previous["continuation"], previous["result"])
+            if inspect.isawaitable(outcome):
+                if inspect.iscoroutine(outcome):
+                    outcome.close()
+                raise RuntimeError("ASYNC_MUTATION_NOT_ALLOWED")
+            self._save_snapshot(current, request, outcome.get("snapshot"))
+            result = self._result(current, request, outcome)
+            self.connection.execute("UPDATE action_requests SET result_json=%s,http_status=%s,result_epoch=%s,continuation_json=NULL WHERE session_id=%s AND request_id=%s", (encode(result), outcome["httpStatus"], current["resetEpoch"], session_id, request["requestId"]))
+            return {"httpStatus": outcome["httpStatus"], "result": result}
+
+    def runtime_transaction(self, session_id, execute):
+        with self.transaction():
+            self._lock_session(session_id)
+            current = self.get_snapshot(session_id)
+            snapshot = copy.deepcopy(current)
+            result = execute(snapshot)
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                raise RuntimeError("ASYNC_TRANSACTION_NOT_ALLOWED")
+            if result["changed"]:
+                snapshot["revision"] = current["revision"] + 1
+                self._save_snapshot(current, {"kind": "runtime_state"}, snapshot)
+            return result["value"]
+
+    def capture_context(self, session_id, request):
+        require_id(request["runId"]); require_id(request["requestId"]); require_int(request["resetEpoch"])
+        with self.transaction():
+            self._lock_session(session_id)
+            snapshot = self.get_snapshot(session_id)
+            if snapshot["resetEpoch"] != request["resetEpoch"]:
+                raise BackendError("STALE_EPOCH", 409)
+            row = self._one("SELECT record_json FROM context_reads WHERE session_id=%s AND run_id=%s AND request_id=%s AND reset_epoch=%s", (session_id, request["runId"], request["requestId"], request["resetEpoch"]))
+            if row:
+                return json.loads(row["record_json"])
+            record = {"id": str(uuid4()), "sessionId": session_id, "runId": request["runId"], "requestId": request["requestId"], "resetEpoch": snapshot["resetEpoch"], "dayKey": snapshot["dayKey"], "versions": context_versions(snapshot), "readinessSnapshotId": snapshot["readiness"]["id"], "createdAt": iso_now(), "snapshot": snapshot}
+            self.connection.execute("INSERT INTO context_reads(id,session_id,run_id,request_id,reset_epoch,record_json) VALUES (%s,%s,%s,%s,%s,%s)", (record["id"], session_id, record["runId"], record["requestId"], record["resetEpoch"], encode(record)))
+            return record
+
+    def get_context_read(self, session_id, context_id, run_id, epoch):
+        with self._lock:
+            current = self.get_snapshot(session_id)
+            if current["resetEpoch"] != epoch:
+                raise BackendError("STALE_EPOCH", 409)
+            row = self._one("SELECT record_json FROM context_reads WHERE id=%s AND session_id=%s AND run_id=%s AND reset_epoch=%s", (context_id, session_id, run_id, epoch))
+            if not row:
+                raise BackendError("CONTEXT_READ_INVALID", 409)
+            record = json.loads(row["record_json"])
+            if record["dayKey"] != current["dayKey"] or record["readinessSnapshotId"] != current["readiness"]["id"]:
+                raise BackendError("CONTEXT_STALE", 409)
+            assert_context_versions(current, record["versions"])
+            return record
+
+    def get_agent_run(self, session_id, run_id):
+        row = self._one("SELECT record_json FROM agent_runs WHERE session_id=%s AND id=%s", (session_id, run_id))
+        return json.loads(row["record_json"]) if row else None
+
+    def find_agent_run(self, session_id, request_id):
+        row = self._one("SELECT record_json FROM agent_runs WHERE session_id=%s AND request_id=%s", (session_id, request_id))
+        return json.loads(row["record_json"]) if row else None
+
+    def list_agent_runs(self, session_id):
+        with self._lock:
+            return [json.loads(row["record_json"]) for row in self.connection.execute("SELECT record_json FROM agent_runs WHERE session_id=%s", (session_id,))]
+
+    def save_agent_run(self, run):
+        self._require_transaction()
+        self.connection.execute("INSERT INTO agent_runs(id,session_id,request_id,reset_epoch,record_json) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(id) DO UPDATE SET record_json=excluded.record_json", (run["id"], run["sessionId"], run["requestId"], run["resetEpoch"], encode(run)))
+
+    def get_readiness_check(self, session_id, key):
+        row = self._one("SELECT record_json FROM readiness_checks WHERE session_id=%s AND check_key=%s", (session_id, key))
+        return json.loads(row["record_json"]) if row else None
+
+    def save_readiness_check(self, check):
+        self._require_transaction()
+        self.connection.execute("INSERT INTO readiness_checks(check_key,session_id,reset_epoch,record_json) VALUES (%s,%s,%s,%s) ON CONFLICT(check_key) DO UPDATE SET record_json=excluded.record_json", (check["key"], check["sessionId"], check["resetEpoch"], encode(check)))
+
+    def consume_readiness_check(self, snapshot, proposal, status):
+        self._require_transaction()
+        if not proposal.get("checkKey") or not proposal.get("checkAttemptId"):
+            return
+        check = self.get_readiness_check(snapshot["sessionId"], proposal["checkKey"])
+        if not check or check["resetEpoch"] != snapshot["resetEpoch"] or check.get("attemptId") != proposal["checkAttemptId"] or check.get("proposalId") != proposal["id"]:
+            return
+        check["status"] = status
+        self.save_readiness_check(check)
+        if (snapshot.get("readinessCheck") or {}).get("key") == check["key"]:
+            snapshot["readinessCheck"]["status"] = status
+
+    def store_user_input(self, record):
+        self._require_transaction()
+        self.connection.execute("INSERT INTO user_inputs(id,session_id,request_id,reset_epoch,record_json) VALUES (%s,%s,%s,%s,%s)", (record["id"], record["sessionId"], record["requestId"], record["resetEpoch"], encode(record)))
+
+    def get_user_input(self, session_id, epoch, source_id):
+        row = self._one("SELECT record_json FROM user_inputs WHERE id=%s AND session_id=%s AND reset_epoch=%s", (source_id, session_id, epoch))
+        return json.loads(row["record_json"]) if row else None
+
+    def list_user_inputs(self, session_id, epoch):
+        with self._lock:
+            return [json.loads(row["record_json"]) for row in self.connection.execute("SELECT record_json FROM user_inputs WHERE session_id=%s AND reset_epoch=%s ORDER BY sequence DESC LIMIT 100", (session_id, epoch))]
+
+    @staticmethod
+    def _assert_source_versions(source):
+        try:
+            versions = source["versions"]
+            require_int(versions["meal"]); require_int(versions["conditions"])
+        except (KeyError, TypeError, BackendError):
+            raise BackendError("AUTHORIZATION_INVALID", 403) from None
+
+    def _assert_authorization_source(self, record, source):
+        self._assert_source_versions(source)
+        if any(record.get(key) != source.get(other) for key, other in (("sourceMessageId", "id"), ("sessionId", "sessionId"), ("resetEpoch", "resetEpoch"))):
+            raise BackendError("AUTHORIZATION_INVALID", 403)
+        if (record.get("expectedConditionsVersion") != source["versions"]["conditions"] if record["scope"] == "conditions_update" else record.get("expectedMealRevision") != source["versions"]["meal"]):
+            raise BackendError("AUTHORIZATION_INVALID", 403)
+
+    def issue_authorization(self, session_id, request, derive):
+        with self.transaction():
+            self._lock_session(session_id)
+            snapshot = self.get_snapshot(session_id)
+            if snapshot["resetEpoch"] != request["resetEpoch"]:
+                raise BackendError("STALE_EPOCH", 409)
+            source = self.get_user_input(session_id, request["resetEpoch"], request["sourceMessageId"])
+            if not source or source["conversationId"] != snapshot["conversationId"]:
+                raise BackendError("AUTHORIZATION_INVALID", 403)
+            self._assert_source_versions(source)
+            row = self._one("SELECT record_json FROM write_authorizations WHERE session_id=%s AND reset_epoch=%s AND source_message_id=%s", (session_id, request["resetEpoch"], source["id"]))
+            if row:
+                record = json.loads(row["record_json"])
+                self._assert_authorization_source(record, source)
+                if record["runId"] != request["runId"]:
+                    raise BackendError("AUTHORIZATION_RUN_MISMATCH", 403)
+                return record
+            constraint = derive(snapshot, source)
+            conditions = constraint["scope"] == "conditions_update"
+            if (source["versions"]["conditions"] != snapshot["conditions"]["version"] if conditions else source["versions"]["meal"] != snapshot["mealRevision"]):
+                raise BackendError("VERSION_CONFLICT", 409)
+            record = {"id": str(uuid4()), "sessionId": session_id, "sourceMessageId": source["id"], "resetEpoch": request["resetEpoch"], "runId": request["runId"], "scope": constraint["scope"], "constraint": constraint, "createdAt": iso_now()}
+            if conditions:
+                record["expectedConditionsVersion"] = snapshot["conditions"]["version"]
+            else:
+                record["expectedMealRevision"] = snapshot["mealRevision"]
+                if constraint["scope"] != "meal_add":
+                    meal = next((m for m in snapshot["meals"] if m["id"] == constraint["mealId"]), None)
+                    if not meal:
+                        raise BackendError("NOT_FOUND", 404)
+                    record["expectedMealVersion"] = meal["version"]
+            self.connection.execute("INSERT INTO write_authorizations(id,session_id,reset_epoch,source_message_id,run_id,record_json) VALUES (%s,%s,%s,%s,%s,%s)", (record["id"], session_id, record["resetEpoch"], source["id"], record["runId"], encode(record)))
+            return record
+
+    def assert_authorization(self, session_id, request, constraint):
+        self._require_transaction()
+        row = self._one("SELECT a.record_json,a.consumed_by_request_id,u.record_json AS source_json FROM write_authorizations a JOIN user_inputs u ON u.id=a.source_message_id AND u.session_id=a.session_id AND u.reset_epoch=a.reset_epoch WHERE a.id=%s AND a.session_id=%s AND a.reset_epoch=%s AND a.run_id=%s", (request["authorizationId"], session_id, request["resetEpoch"], request["runId"]))
+        if not row:
+            raise BackendError("AUTHORIZATION_INVALID", 403)
+        if row["consumed_by_request_id"] is not None:
+            raise BackendError("AUTHORIZATION_CONSUMED", 409)
+        record = json.loads(row["record_json"])
+        self._assert_authorization_source(record, json.loads(row["source_json"]))
+        if canonical_json(record["constraint"]) != canonical_json(constraint) or any(record.get(key) != request.get(key) for key in ("expectedMealRevision", "expectedMealVersion", "expectedConditionsVersion")):
+            raise BackendError("AUTHORIZATION_MISMATCH", 403)
+        return record
+
+    def consume_authorization(self, session_id, authorization_id, request_id):
+        self._require_transaction()
+        changed = self.connection.execute("UPDATE write_authorizations SET consumed_by_request_id=%s WHERE id=%s AND session_id=%s AND consumed_by_request_id IS NULL", (request_id, authorization_id, session_id))
+        if changed.rowcount != 1:
+            raise BackendError("AUTHORIZATION_CONSUMED", 409)
+
+    def get_meal_entity(self, session_id, epoch, meal_id):
+        self._require_transaction()
+        row = self._one("SELECT version,head_operation_id FROM meal_entities WHERE session_id=%s AND reset_epoch=%s AND meal_id=%s", (session_id, epoch, meal_id))
+        return {"mealId": meal_id, "version": row["version"], "headOperationId": row["head_operation_id"]} if row else None
+
+    def save_meal_entity(self, session_id, epoch, entity):
+        self._require_transaction()
+        self.connection.execute("INSERT INTO meal_entities(session_id,reset_epoch,meal_id,version,head_operation_id) VALUES (%s,%s,%s,%s,%s) ON CONFLICT(session_id,reset_epoch,meal_id) DO UPDATE SET version=excluded.version,head_operation_id=excluded.head_operation_id", (session_id, epoch, entity["mealId"], entity["version"], entity.get("headOperationId")))
+
+    def get_meal_operation(self, session_id, epoch, operation_id):
+        self._require_transaction()
+        row = self._one("SELECT record_json FROM meal_operations WHERE id=%s AND session_id=%s AND reset_epoch=%s", (operation_id, session_id, epoch))
+        return json.loads(row["record_json"]) if row else None
+
+    def store_meal_operation(self, record):
+        self._require_transaction()
+        self.connection.execute("INSERT INTO meal_operations(id,session_id,reset_epoch,meal_id,record_json) VALUES (%s,%s,%s,%s,%s)", (record["id"], record["sessionId"], record["resetEpoch"], record["mealId"], encode(record)))
+
+    def mark_meal_operation_undone(self, record, request_id):
+        self._require_transaction()
+        updated = {**record, "status": "undone", "undoneByRequestId": request_id}
+        changed = self.connection.execute("UPDATE meal_operations SET record_json=%s WHERE id=%s AND session_id=%s AND reset_epoch=%s", (encode(updated), record["id"], record["sessionId"], record["resetEpoch"]))
+        if changed.rowcount != 1:
+            raise BackendError("UNDO_CONFLICT", 409)
+
+
+WellioDatabase = Database
